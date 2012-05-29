@@ -8,11 +8,11 @@ def returnmultipart():
     boundary='----multipart-boundary-%s----' % (uuid.uuid1(),)
     response.content_type = 'multipart/mixed; boundary=%s' % (boundary,)
     s = boundary + "\n"
-    s += 'Content-Disposition: attachment filename="hej"\n'
+    s += 'Content-Disposition: attachment; filename="hej";\n'
     s += '\n'
     s += '<html><head/><body>HEj!</body></html>\n'
     s += boundary + "\n"
-    s += 'Content-Disposition: attachment filename="hej"\n'
+    s += 'Content-Disposition: attachment; filename="hej2";\n'
     s += '\n'
     s += '<html><head/><body>HEj2!</body></html>\n'
     s += boundary + '\n'

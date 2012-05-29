@@ -5,6 +5,7 @@ import json
 import threading
 import datetime
 import random
+import StringIO
 
 from bottle import route, run, request, response, install
 
@@ -12,6 +13,12 @@ from netdicom.SOPclass import *
 from dicom.UID import ExplicitVRLittleEndian, ImplicitVRLittleEndian, ExplicitVRBigEndian
 
 from netdicom.applicationentity import AE
+
+def media_storage_sop_instance_uid():
+    return conf['DICOMUIDRoot'] + '15.1'
+
+def implementation_class_uid():
+    return conf['DICOMUIDRoot'] + '15.2'
 
 def generate_uid():
     root = conf['DICOMUIDRoot']
@@ -66,6 +73,12 @@ def add_DIMSE_tags_to_pydicom():
     dicom.datadict.keyword_dict = dict([(dicom.datadict.dictionary_keyword(tag), tag) for tag in dicom.datadict.DicomDictionary])
 
 add_DIMSE_tags_to_pydicom()
+
+def DicomFileStringIO(is_implicit_VR = True, is_little_endian = True, buf=''):
+    fp = dicom.filebase.DicomFileLike(StringIO.StringIO(buf))
+    fp.is_implicit_VR = is_implicit_VR
+    fp.is_little_endian = is_little_endian
+    return fp
 
 def strize_dict(d):
     # pynetdicom has trouble receiving unicode strings in some
@@ -167,6 +180,46 @@ class StoreSCPAE(AE):
         # must return appropriate status
         return SOPClass.Success
 
+def write_file(dataset):
+    """Store the Dataset specified and return it as a string.
+    
+    If there is no Transfer Syntax tag in the dataset,
+       Set dataset.is_implicit_VR, and .is_little_endian
+       to determine the transfer syntax used to write the file.
+    """
+
+    # Decide whether to write DICOM preamble. Should always do so unless trying to mimic the original file read in
+    preamble = "\0"*128
+    
+    file_meta = dataset.file_meta
+    if file_meta is None:
+        file_meta = Dataset()
+    if 'TransferSyntaxUID' not in file_meta:
+        if dataset.is_little_endian and dataset.is_implicit_VR:
+            file_meta.add_new((2, 0x10), 'UI', ImplicitVRLittleEndian)
+        elif dataset.is_little_endian and not dataset.is_implicit_VR:
+            file_meta.add_new((2, 0x10), 'UI', ExplicitVRLittleEndian)
+        elif dataset.is_big_endian and not dataset.is_implicit_VR:
+            file_meta.add_new((2, 0x10), 'UI', ExplicitVRBigEndian)
+        else:
+            raise NotImplementedError, "pydicom has not been verified for Big Endian with Implicit VR"
+        
+    fp = DicomFileStringIO(is_implicit_VR = dataset.is_implicit_VR, is_little_endian = dataset.is_little_endian)
+    try:
+        fp.write(preamble)  # blank 128 byte preamble
+        dicom.filewriter._write_file_meta_info(fp, file_meta) 
+        
+        # Set file VR, endian. MUST BE AFTER writing META INFO (which changes to Explict LittleEndian)
+        fp.is_implicit_VR = dataset.is_implicit_VR
+        fp.is_little_endian = dataset.is_little_endian
+        
+        dicom.filewriter.write_dataset(fp, dataset)
+        return fp.parent.getvalue()
+    finally:
+        fp.close()
+    return None
+
+
 receivedSOPInstances = {}
 receivedSOPInstanceEvents = {}
 
@@ -217,8 +270,6 @@ def get(pacsname, qrlevel):
             assert False, "Unknown tag"
 
     ds.QueryRetrieveLevel = qrlevel.upper()
-    #ds.MoveDestination = conf['LocalAETitle']
-    #ds.Priority = 2 # "MEDIUM", TODO
 
     receivedSOPInstanceEvents[ds.SOPInstanceUID] = threading.Event()
 
@@ -229,7 +280,20 @@ def get(pacsname, qrlevel):
     del receivedSOPInstanceEvents[ds.SOPInstanceUID]
     retrievedDS = receivedSOPInstances[ds.SOPInstanceUID]
     del receivedSOPInstances[ds.SOPInstanceUID]
-    return str(retrievedDS)
+    file_meta = dicom.dataset.Dataset()
+    file_meta.MediaStorageSOPClassUID = retrievedDS.SOPClassUID
+    file_meta.MediaStorageSOPInstanceUID = media_storage_sop_instance_uid()
+    file_meta.ImplementationClassUID = implementation_class_uid()
+
+    fds = dicom.dataset.FileDataset(None, {}, file_meta=file_meta, preamble="\0" * 128)
+    fds.update(retrievedDS)
+    fds.is_little_endian = True
+    fds.is_implicit_VR = True
+
+    response.content_type = 'application/dicom'
+    response.headers['Content-Disposition'] = 'attachment; filename="%s_%s.dcm"' % (fds.Modality, fds.SOPInstanceUID,)
+
+    return write_file(fds)
 
 conf = strize_dict(json.load(file("dicombridge.conf")))
 

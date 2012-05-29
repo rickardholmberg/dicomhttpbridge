@@ -1,0 +1,4 @@
+bottle==0.10.9
+pydicom==0.9.7
+pynetdicom==0.8.0
+wsgiref==0.1.2

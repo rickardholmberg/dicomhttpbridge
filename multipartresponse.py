@@ -11,6 +11,10 @@ def returnmultipart():
     s += 'Content-Disposition: attachment filename="hej"\n'
     s += '\n'
     s += '<html><head/><body>HEj!</body></html>\n'
+    s += boundary + "\n"
+    s += 'Content-Disposition: attachment filename="hej"\n'
+    s += '\n'
+    s += '<html><head/><body>HEj2!</body></html>\n'
     s += boundary + '\n'
 
     return s

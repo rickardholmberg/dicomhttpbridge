@@ -2,26 +2,109 @@
 import dicom
 import re
 import json
-from werkzeug.wrappers import Request, Response
-from werkzeug.routing import Map, Rule
-from werkzeug.exceptions import HTTPException
-from werkzeug.utils import redirect
+import threading
+import datetime
+import random
+
+from bottle import route, run, request, response, install
 
 from netdicom.SOPclass import *
 from dicom.UID import ExplicitVRLittleEndian, ImplicitVRLittleEndian, ExplicitVRBigEndian
 
-def _minihtml(title, body):
-    return Response("<!DOCTYPE html><html><head><title>%s</title></head><body>%s</body></html>" % (title, body), mimetype='text/html')
-
 from netdicom.applicationentity import AE
+
+def generate_uid():
+    root = conf['DICOMUIDRoot']
+    suffix = datetime.datetime.isoformat(datetime.datetime.utcnow()).replace('-','').replace('T','.').replace(":","")
+    while suffix.find(".0") != -1:
+        suffix = suffix.replace(".0",".")
+    if suffix.endswith("."):
+        suffix = suffix[:-1]
+    suffix += '.' + str(random.randint(0,10**(63-len(root+suffix))-1))
+    return root + suffix
+
+
+def add_DIMSE_tags_to_pydicom():
+    # See DICOM PS3.7-2011, Table E.1-1
+    DimseDicomDictionary = {
+        0x00000000: ('UL', '1', "Command Group Length", ''),
+        0x00000002: ('UI', '1', "Affected SOP Class UID", ''),
+        0x00000003: ('UI', '1', "Requested SOP Class UID", ''),
+        0x00000100: ('US', '1', "Command Field", ''),
+        0x00000110: ('US', '1', "Message ID", ''),
+        0x00000120: ('US', '1', "Message ID Being Responded To", ''),
+        0x00000600: ('AE', '1', "Move Destination", ''),
+        0x00000700: ('US', '1', "Priority", ''),
+        0x00000800: ('US', '1', "Command Data Set Type", ''),
+        0x00000900: ('US', '1', "Status", ''),
+        0x00000901: ('AT', '1-n', "Offending Element", ''),
+        0x00000902: ('LO', '1', "Error Comment", ''),
+        0x00000903: ('US', '1', "Error ID", ''),
+        0x00001000: ('UI', '1', "Affected SOP Instance UID", ''),
+        0x00001001: ('UI', '1', "Requested SOP Instance UID", ''),
+        0x00001002: ('US', '1', "Event Type ID", ''),
+        0x00001005: ('AT', '1-n', "Attribute Identifier List", ''),
+        0x00001008: ('US', '1', "Action Type ID", ''),
+        0x00001020: ('US', '1', "Number of Remaining Sub-operations", ''),
+        0x00001021: ('US', '1', "Number of Completed Sub-operations", ''),
+        0x00001022: ('US', '1', "Number of Failed Sub-operations", ''),
+        0x00001023: ('US', '1', "Number of Warning Sub-operations", ''),
+        0x00001030: ('AE', '1', "Move Originator Application Entity Title", ''),
+        0x00001031: ('US', '1', "Move Originator Message ID", ''),
+        }
+    
+    if len(dicom._dicom_dict.DicomDictionary.values()[0]) == 5:
+        # Handles pydicom < 1.0
+        for k,v in DimseDicomDictionary.iteritems():
+            DimseDicomDictionary[k] = (v[0], v[1], v[2], v[3], v[2].replace(" ","").replace("-",""))
+
+    dicom._dicom_dict.DicomDictionary.update(DimseDicomDictionary)
+
+    # TODO: Add method update_namedict() to datadict.py
+    # Provide for the 'reverse' lookup. Given clean name, what is the tag?
+    dicom.datadict.NameDict = {dicom.datadict.CleanName(tag): tag for tag in dicom.datadict.DicomDictionary}
+    dicom.datadict.keyword_dict = dict([(dicom.datadict.dictionary_keyword(tag), tag) for tag in dicom.datadict.DicomDictionary])
+
+add_DIMSE_tags_to_pydicom()
+
+def strize_dict(d):
+    # pynetdicom has trouble receiving unicode strings in some
+    # positions, so make everything in the config strings instead of
+    # unicode.
+    for k,v in d.iteritems():
+        if isinstance(v, unicode):
+            d[k] = str(v)
+        elif isinstance(v, dict):
+            d[k] = strize_dict(v)
+    return d
+
+def dicom_to_plain(x):
+    if isinstance(x, dicom.dataset.Dataset):
+        return [{'tag':"(%04x,%04x)" % (k.group, k.elem),
+                 'value': dicom_to_plain(v),
+                 'VR': v.VR,
+                 'name': dicom.datadict.DicomDictionary.get(k.group << 16 | k.elem, ('','','N/A'))[2]}
+                for k,v in x.iteritems()]
+    if isinstance(x, dicom.dataelem.RawDataElement) or isinstance(x, dicom.dataelem.DataElement):
+        return dicom_to_plain(x.value)
+    if isinstance(x, dicom.sequence.Sequence):
+        return [dicom_to_plain(y) for y in x]
+    if isinstance(x, dicom.valuerep.DS):
+        return float(x)
+    if isinstance(x, dicom.valuerep.IS):
+        return int(x)
+    if isinstance(x, list):
+        return [dicom_to_plain(v) for v in x]
+    return x
 
 class QRSCUAE(AE):
     def __init__(self, calling_ae):
-        super(QRSCUAE,self).__init__(calling_ae, 65500,
+        super(QRSCUAE,self).__init__(calling_ae, 
                                      [PatientRootFindSOPClass, VerificationSOPClass],
                                      [StorageSOPClass], [ImplicitVRLittleEndian])
 
     def find(self, address, port, called_ae, query_dataset):
+        print "find(%s, %s, %s)" % (address, port ,called_ae)
         assoc = self.RequestAssociation({'Address': address, 'Port': port, 'AET': called_ae})
         print "DICOM Echo ... ",
         st = assoc.VerificationSOPClass.SCU(1)
@@ -34,61 +117,133 @@ class QRSCUAE(AE):
         assoc.Release(0)
         return res
 
-class DicomBridge(object):
-    def __init__(self, config):
-        self.url_map = Map([
-            Rule('/<pacsname>/find/<qrlevel>', endpoint='qrfind'),
-            ])
+class MoveSCUAE(AE):
+    def __init__(self, calling_ae):
+        super(MoveSCUAE,self).__init__(calling_ae, 
+                                       [PatientRootFindSOPClass,
+                                        PatientRootMoveSOPClass,
+                                        VerificationSOPClass],
+                                       [StorageSOPClass], [ImplicitVRLittleEndian])
 
-    def dispatch_request(self, request):
-        adapter = self.url_map.bind_to_environ(request.environ)
-        try:
-            endpoint, values = adapter.match()
-            return getattr(self, 'on_' + endpoint)(request, **values)
-        except HTTPException, e:
-            return e
-        
-    def on_qrfind(self, request, pacsname, qrlevel):
-        assert qrlevel in ["patient", "study", "series", "image"]
+    def move(self, address, port, called_ae, query_dataset):
+        # TODO other Q/R level and frame range keys
+        assoc = self.RequestAssociation({'Address': address, 'Port': port, 'AET': called_ae})
+        print "DICOM Echo ... ",
+        st = assoc.VerificationSOPClass.SCU(1)
+        print 'done with status "%s"' % st
+        print "DICOM MoveSCU ... ",
+        st = assoc.PatientRootMoveSOPClass.SCU(query_dataset, conf['LocalAETitle'], 1)
+        st = [x for x in st]
+        print 'move status "%s"' % st
 
-        ds = dicom.dataset.Dataset()
-        for k,v in request.args.iteritems():
-            if k in dicom.datadict.NameDict:
-                setattr(ds,k,v)
-            elif re.match("\([0-9a-fA-F]{4},[0-9a-fA-F]{4}\)", k):
-                tag = (int(k[1:5], 16), int(k[6:10], 16))
-                vr = dicom.datadict.dictionaryVR(tag)
-                ds.add_new(tag, vr, v)
-            else:
-                assert False, "Unknown tag"
+        assoc.Release(0)
+        return st
 
-        ds.QueryRetrieveLevel = qrlevel.upper()
+class StoreSCPAE(AE):
+    @staticmethod
+    def OnAssociateRequest(association):
+        print "Associate request: %s" % (association,)
 
-        s = 'PacsName: %s<br/>Q/R Level: %s<br/>' % (pacsname, qrlevel)
-        s += '<pre>' + str(ds) + '</pre>'
+    @staticmethod
+    def OnAssociateResponse(association):
+        print "Association response received"
 
-        ae = QRSCUAE("VIOLANTA")
-        ae.start()
-        st = ae.find("test.myhealthaccount.com", 104, "READWRITE", ds)
-        s += '<pre>' + str(reduce(list.__add__, [list(x[1:]) for x in st])) + '</pre>'
-        ae.Quit()
-        
-        return _minihtml('Logged in!', s)
+    @staticmethod
+    def OnReceiveEcho(verificationServiceClass):
+        print "Echo received: %s" % (verificationServiceClass,)
 
-    def wsgi_app(self, environ, start_response):
-        request = Request(environ)
-        response = self.dispatch_request(request)
-        return response(environ, start_response)
+    @staticmethod
+    def OnReceiveStore(SOPClass, DS):
+        print "Received C-STORE"
 
-    def __call__(self, environ, start_response):
-        return self.wsgi_app(environ, start_response)
+        if DS.SOPInstanceUID not in receivedSOPInstanceEvents:
+            print "Received unexpected SOP Instance %s! Discarding." % (DS.SOPInstanceUID,)
+        else:
+            print "Received SOP Instance %s. Waking client." % (DS.SOPInstanceUID,)
+            evt = receivedSOPInstanceEvents[DS.SOPInstanceUID]
+            receivedSOPInstances[DS.SOPInstanceUID] = DS
+            evt.set()
 
-def create_app():
-    app = DicomBridge(json.load(file("dicombridge.conf")))
-    return app
+        # must return appropriate status
+        return SOPClass.Success
+
+receivedSOPInstances = {}
+receivedSOPInstanceEvents = {}
+
+@route("/<pacsname>/find/<qrlevel>")
+def qrfind(pacsname, qrlevel):
+    assert qrlevel in ["patient", "study", "series", "image"]
+
+    ds = dicom.dataset.Dataset()
+    for k,v in request.query.iteritems():
+        if k in dicom.datadict.NameDict:
+            setattr(ds,k,v)
+        elif re.match("\([0-9a-fA-F]{4},[0-9a-fA-F]{4}\)", k):
+            tag = (int(k[1:5], 16), int(k[6:10], 16))
+            vr = dicom.datadict.dictionaryVR(tag)
+            ds.add_new(tag, vr, v)
+        else:
+            assert False, "Unknown tag"
+
+    ds.QueryRetrieveLevel = qrlevel.upper()
+
+    print 'PacsName: %s\n>Q/R Level: %s' % (pacsname, qrlevel)
+    print ds
+    
+    ae = QRSCUAE(conf['LocalAETitle'])
+    pacs = conf['RemoteAEs'][pacsname]
+    print pacs
+    st = ae.find(address=pacs['Address'], port=pacs['Port'], called_ae=pacs['AETitle'], query_dataset=ds)
+    print reduce(list.__add__, [list(x[1:]) for x in st], [])
+    ae.Quit()
+    
+    return {'status': 'Success',
+            'datasets': dicom_to_plain(reduce(list.__add__, [list(x[1:]) for x in st if x[0].Type != 'Success'], []))}
+
+@route("/<pacsname>/get/<qrlevel>")
+def get(pacsname, qrlevel):
+    assert qrlevel in 'image'
+    ae = MoveSCUAE(conf['LocalAETitle'])
+
+    ds = dicom.dataset.Dataset()
+    for k,v in request.query.iteritems():
+        if k in dicom.datadict.NameDict:
+            setattr(ds,k,v)
+        elif re.match("\([0-9a-fA-F]{4},[0-9a-fA-F]{4}\)", k):
+            tag = (int(k[1:5], 16), int(k[6:10], 16))
+            vr = dicom.datadict.dictionaryVR(tag)
+            ds.add_new(tag, vr, v)
+        else:
+            assert False, "Unknown tag"
+
+    ds.QueryRetrieveLevel = qrlevel.upper()
+    #ds.MoveDestination = conf['LocalAETitle']
+    #ds.Priority = 2 # "MEDIUM", TODO
+
+    receivedSOPInstanceEvents[ds.SOPInstanceUID] = threading.Event()
+
+    pacs = conf['RemoteAEs'][pacsname]
+    print ae.move(address=pacs['Address'], port=pacs['Port'], called_ae=pacs['AETitle'], query_dataset = ds)
+    ae.Quit()
+
+    del receivedSOPInstanceEvents[ds.SOPInstanceUID]
+    retrievedDS = receivedSOPInstances[ds.SOPInstanceUID]
+    del receivedSOPInstances[ds.SOPInstanceUID]
+    return str(retrievedDS)
+
+conf = strize_dict(json.load(file("dicombridge.conf")))
 
 if __name__ == '__main__':
-    from werkzeug.serving import run_simple
-    app = create_app()
-    run_simple('0.0.0.0', 5000, app, use_debugger=True, use_reloader=True)
+
+    storescpae = StoreSCPAE(AET=conf['LocalAETitle'], port=conf['LocalPort'],
+                            SOPSCU=[],
+                            SOPSCP=[MRImageStorageSOPClass,
+                                    CTImageStorageSOPClass,
+                                    RTImageStorageSOPClass,
+                                    RTPlanStorageSOPClass,
+                                    PositronEmissionTomographyImageStorageSOPClass, VerificationSOPClass])
+    storescpae.start()
+
+    run(host='localhost', port=5000)
+    storescpae.Quit()
 

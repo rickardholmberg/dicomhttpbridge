@@ -13,7 +13,6 @@ def returnmultipart():
     s = catio.CatIO()
 
     for fn in glob.glob("*.dcm"):
-        print fn
         s += "\r\n" + boundary + "\r\n"
         s += 'Content-Disposition: attachment; filename="%s";\r\n' % (fn,)
         s += 'Content-Type: application/dicom;\r\n'
@@ -22,6 +21,10 @@ def returnmultipart():
         s += file(fn)
 
     s += '\r\n' + boundary + '\r\n'
+
+    s.seek(0,2)
+    response.content_length = s.tell()
+    s.seek(0)
 
     return s
     

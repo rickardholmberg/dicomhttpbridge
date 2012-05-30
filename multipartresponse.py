@@ -3,6 +3,7 @@
 from bottle import route, run, request, response, install
 import uuid
 import glob
+import os
 
 @route("/")
 def returnmultipart():
@@ -12,15 +13,14 @@ def returnmultipart():
 
     for fn in glob.glob("*.dcm"):
         print fn
-        s += "\n" + boundary + "\n"
-        s += 'Content-Disposition: attachment; filename="%s";\n' % (fn,)
-        s += 'Content-Type: application/dicom;\n'
-        q = file(fn).read()
-        s += 'Content-Length: %i\n' % (len(q),)
-        s += '\n'
-        s += q
+        s += "\r\n" + boundary + "\r\n"
+        s += 'Content-Disposition: attachment; filename="%s";\r\n' % (fn,)
+        s += 'Content-Type: application/dicom;\r\n'
+        s += 'Content-Length: %i\r\n' % (os.stat(fn).st_size,)
+        s += '\r\n'
+        s += file(fn).read()
 
-    s += '\n' + boundary + '\n'
+    s += '\r\n' + boundary + '\r\n'
 
     return s
     

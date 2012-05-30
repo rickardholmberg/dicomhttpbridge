@@ -18,7 +18,7 @@ class CatIO(object):
         else:
             r = self._bufs[self._curbuf].read(size)
         self._curpos += len(r)
-        if size != None and len(r) == size:
+        if size != None and len(r) >= size:
             return r
         if self._curbuf >= len(self._bufs)-1:
             return r
